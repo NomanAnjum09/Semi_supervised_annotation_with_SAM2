@@ -204,7 +204,6 @@ class HoverMaskViewer(QLabel):
             QMessageBox.critical(self, "Prediction Error", str(ex))
 
     def _redraw_overlay(self, cursor_disp_pt: Optional[QPoint] = None):
-        """Blend latest mask onto the display image and draw cursor dot."""
         if self._img_disp is None:
             return
 
@@ -218,25 +217,19 @@ class HoverMaskViewer(QLabel):
                 interpolation=cv2.INTER_NEAREST
             ).astype(bool)
 
-            # Colorize mask (teal-ish) and alpha-blend
+            # Colorize mask and alpha-blend
             color = np.array([0, 200, 200], dtype=np.uint8)  # BGR
             alpha = 0.35
             colored = np.zeros_like(overlay)
             colored[mask_disp] = color
             overlay = cv2.addWeighted(overlay, 1.0, colored, alpha, 0.0)
 
-            # Outline mask (optional)
+            # Optional outline
             contours, _ = cv2.findContours(mask_disp.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(overlay, contours, -1, (0, 255, 255), 1)  # thin outline
-
-        # Draw a small cursor dot at the current mouse position for feedback
-        if cursor_disp_pt is not None:
-            cx, cy = cursor_disp_pt.x(), cursor_disp_pt.y()
-            # Ensure it's within the widget bounds
-            if 0 <= cx < self.width() and 0 <= cy < self.height():
-                cv2.circle(overlay, (cx, cy), self._cursor_radius, (255, 255, 255), -1)
+            cv2.drawContours(overlay, contours, -1, (0, 255, 255), 1)
 
         self._update_pixmap(overlay)
+
 
     def _update_pixmap(self, bgr: np.ndarray):
         h, w = bgr.shape[:2]
