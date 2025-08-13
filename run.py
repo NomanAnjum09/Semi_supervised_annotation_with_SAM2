@@ -1,8 +1,25 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+PyQt5 SAM2 UI — Hover to preview masks; right-click add / left-click subtract.
+Right panel shows a single-select class list from --classes.
+
+Run:
+  python sam2_hover_preview.py \
+      --ckpt /path/to/sam2_checkpoint.pt \
+      --config configs/sam2.1/sam2.1_hiera_l.yaml \
+      --image /path/to/image.jpg \
+      --classes A1 A2 A3 A4 A5 A6 B1 B2 B3 B4 B5 B6 C1 C2 C3 C4 C5 C6
+
+Shortcuts:
+  Z = undo last click
+  C = clear all clicks (return to hover mode)
+"""
 
 import os, os.path as osp
 os.environ.pop("QT_PLUGIN_PATH", None)                 # avoid cv2's plugin dir
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")        # prefer X11 on Linux
-
 try:
     import PyQt5  # import first to locate its plugins
     os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = osp.join(
@@ -14,22 +31,24 @@ except Exception:
 import sys
 import argparse
 import time
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 import numpy as np
 import cv2
 
-from PyQt5.QtCore import Qt, QTimer, QRect, QPoint
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen
+from PyQt5.QtCore import Qt, QTimer, QPoint
+from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QLabel, QMainWindow, QFileDialog, QWidget, QVBoxLayout, QMessageBox, QAction
+    QApplication, QLabel, QMainWindow, QFileDialog, QWidget,
+    QVBoxLayout, QHBoxLayout, QMessageBox, QAction,
+    QListWidget, QAbstractItemView, QFrame
 )
 
-# -------------------- SAM / SAM2 loader (as provided) --------------------
+# -------------------- SAM / SAM2 loader --------------------
 class Segmenter:
     def __init__(self, ckpt_path: str, config: str, device: str = None):
         self.device = device or ("cuda" if self._torch_cuda_available() else "cpu")
-        self.kind = None  # "sam2" or "sam"
+        self.kind = None  # "sam2"
         self.predictor = None
         self._init_model(ckpt_path, config)
 
@@ -41,7 +60,6 @@ class Segmenter:
             return False
 
     def _init_model(self, ckpt_path: str, config: str):
-        # Try SAM2 first
         try:
             from sam2.build_sam import build_sam2
             from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -52,49 +70,50 @@ class Segmenter:
             return
         except Exception as e:
             raise RuntimeError(
-                f"Failed to initialize SAM2 or SAM. Ensure packages/checkpoint/model_type are correct. Error: {e}"
+                f"Failed to initialize SAM2. Ensure packages/checkpoint/config are correct. Error: {e}"
             )
 
     def set_image(self, image_bgr: np.ndarray):
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         self.predictor.set_image(image_rgb)
 
+    # Multi-point (add/subtract) refinement
     def predict_from_points(self, points_xy, labels01) -> Tuple[np.ndarray, float]:
         """
-        points_xy: List[Tuple[int,int]] or Nx2 np.array in image coords (original size)
-        labels01:  List[int] or (N,) np.array with 1 (add) or 0 (subtract)
-        Returns: (best_mask_bool, best_score_float)
+        points_xy: List[(x,y)] or Nx2 array, ORIGINAL image coords
+        labels01:  List[int] (1=add, 0=subtract)
         """
-        pts = np.asarray(points_xy, dtype=np.int32)
+        pts = np.asarray(points_xy, dtype=np.float32)
         if pts.ndim != 2 or pts.shape[1] != 2:
             raise ValueError("points_xy must be Nx2")
         labs = np.asarray(labels01, dtype=np.int32).reshape(-1)
         if labs.shape[0] != pts.shape[0]:
             raise ValueError("labels01 length must match points")
         masks, scores, _ = self.predictor.predict(
-            point_coords=pts.astype(np.float32),
-            point_labels=labs.astype(np.int32),
+            point_coords=pts,
+            point_labels=labs,
             multimask_output=True
         )
         i = int(np.argmax(scores))
         return masks[i].astype(bool), float(scores[i])
-    
-    
+
+    # Optional wrapper for single-point use
+    def predict_from_point(self, x: int, y: int, positive: bool = True) -> Tuple[np.ndarray, float]:
+        return self.predict_from_points([(x, y)], [1 if positive else 0])
 
 
-
-
-# -------------------- Image Viewer Widget --------------------
+# -------------------- Image Viewer --------------------
 class HoverMaskViewer(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setAlignment(Qt.AlignCenter)
-        self.setContextMenuPolicy(Qt.NoContextMenu)  # let right-click be our add-click
+        self.setContextMenuPolicy(Qt.NoContextMenu)
+        self.setFocusPolicy(Qt.StrongFocus)
 
-        self._img_bgr = None
-        self._img_disp = None
-        self._seg = None
+        self._img_bgr: Optional[np.ndarray] = None
+        self._img_disp: Optional[np.ndarray] = None
+        self._seg: Optional[Segmenter] = None
 
         self._scale = 1.0
         self._offset_x = 0
@@ -102,59 +121,32 @@ class HoverMaskViewer(QLabel):
 
         self._hover_timer = QTimer(self)
         self._hover_timer.setSingleShot(True)
-        self._hover_timer.setInterval(30)
+        self._hover_timer.setInterval(30)  # ms
         self._hover_timer.timeout.connect(self._do_predict_hover)
 
-        self._last_mouse_pos = None
+        self._last_mouse_pos: Optional[QPoint] = None
         self._last_pred_time = 0.0
 
-        self._last_mask = None
-        self._last_score = None
+        self._last_mask: Optional[np.ndarray] = None
+        self._last_score: Optional[float] = None
 
-        # NEW: click history for SAM-style refinement
-        self._click_points = []   # List[(x,y)]
-        self._click_labels = []   # List[int] 1=add, 0=subtract
-
-        # Optional: draw small markers at clicked points
+        # SAM-style refinement state
+        self._click_points: List[Tuple[int, int]] = []
+        self._click_labels: List[int] = []         # 1=add (RMB), 0=subtract (LMB)
         self._show_click_markers = True
-    
-    def _disp_to_img_coords(self, p: QPoint) -> Optional[Tuple[int, int]]:
-        """Map widget/display coords back to original image coords."""
-        if self._img_bgr is None:
-            return None
-        x = p.x() - self._offset_x
-        y = p.y() - self._offset_y
-        if x < 0 or y < 0:
-            return None
-        H, W = self._img_bgr.shape[:2]
-        ix = int(x / self._scale)
-        iy = int(y / self._scale)
-        if ix < 0 or iy < 0 or ix >= W or iy >= H:
-            return None
-        return ix, iy
 
-    def _update_pixmap(self, bgr: np.ndarray):
-        h, w = bgr.shape[:2]
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        # Class selection (set by MainWindow)
+        self._selected_class: Optional[str] = None
 
-        # Make sure memory is contiguous and uint8
-        rgb = np.require(rgb, dtype=np.uint8, requirements=["C"])
-
-        # bytesPerLine = stride for the first dimension
-        bytes_per_line = rgb.strides[0]
-
-        # Build QImage from the NumPy buffer
-        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-
-        # Keep a reference so the data pointer stays valid
-        self._qimage_buf = rgb
-
-        pix = QPixmap.fromImage(qimg)
-        self.setPixmap(pix)
-
+        # keep reference to bytes for QImage
+        self._qimage_bytes = None
 
     def set_segmenter(self, seg: Segmenter):
         self._seg = seg
+
+    def set_selected_class(self, name: Optional[str]):
+        """MainWindow calls this when selection changes."""
+        self._selected_class = name
 
     def set_image(self, img_bgr: np.ndarray):
         assert img_bgr.ndim == 3 and img_bgr.shape[2] == 3, "Expected BGR image"
@@ -164,13 +156,13 @@ class HoverMaskViewer(QLabel):
             self._seg.set_image(self._img_bgr)
         self._last_mask = None
         self._last_score = None
+        self._click_points.clear()
+        self._click_labels.clear()
         self._update_pixmap(self._img_disp)
 
     def _prepare_display_image(self):
-        """Compute scaled display image to fit the widget while preserving aspect ratio."""
         if self._img_bgr is None:
             return
-        # Size to fit current widget
         w = max(1, self.width())
         h = max(1, self.height())
         H, W = self._img_bgr.shape[:2]
@@ -180,7 +172,6 @@ class HoverMaskViewer(QLabel):
         disp = cv2.resize(self._img_bgr, (newW, newH), interpolation=cv2.INTER_AREA)
         self._img_disp = disp
         self._scale = scale
-        # Compute centering offsets
         self._offset_x = (w - newW) // 2
         self._offset_y = (h - newH) // 2
 
@@ -194,7 +185,6 @@ class HoverMaskViewer(QLabel):
         if self._img_bgr is None or self._seg is None:
             return
         self._last_mouse_pos = e.pos()
-        # Only do hover prediction when no refinement clicks yet
         if len(self._click_points) == 0:
             self._hover_timer.start()
 
@@ -213,46 +203,44 @@ class HoverMaskViewer(QLabel):
         else:
             return
 
-        # Record click
         self._click_points.append(pt_img)
         self._click_labels.append(label)
-
-        # Predict with all points so far
         try:
             mask, score = self._seg.predict_from_points(self._click_points, self._click_labels)
             self._last_mask = mask
             self._last_score = score
             self._redraw_overlay()
-            self.parent().parent().show_score(score)
+            mw = self.window()
+            if hasattr(mw, "show_score"):
+                mw.show_score(score)
         except Exception as ex:
             QMessageBox.critical(self, "Prediction Error", str(ex))
 
     def keyPressEvent(self, e):
-        # Z: undo last point, C: clear all points
-        if e.key() in (Qt.Key_Z,):
+        if e.key() == Qt.Key_Z:
             if self._click_points:
                 self._click_points.pop()
                 self._click_labels.pop()
                 self._recompute_from_clicks_or_clear()
-        elif e.key() in (Qt.Key_C,):
+        elif e.key() == Qt.Key_C:
             self._click_points.clear()
             self._click_labels.clear()
             self._last_mask = None
             self._last_score = None
-            # back to hover mode
             self._redraw_overlay()
         else:
             super().keyPressEvent(e)
 
     def _recompute_from_clicks_or_clear(self):
-        # Recompute current refined mask if any clicks remain; else clear and show base image
         if self._click_points:
             try:
                 mask, score = self._seg.predict_from_points(self._click_points, self._click_labels)
                 self._last_mask = mask
                 self._last_score = score
                 self._redraw_overlay()
-                self.parent().parent().show_score(score)
+                mw = self.window()
+                if hasattr(mw, "show_score"):
+                    mw.show_score(score)
             except Exception as ex:
                 QMessageBox.critical(self, "Prediction Error", str(ex))
         else:
@@ -260,8 +248,28 @@ class HoverMaskViewer(QLabel):
             self._last_score = None
             self._redraw_overlay()
 
+    def leaveEvent(self, e):
+        if self._img_bgr is not None and not self._click_points:
+            self._last_mask = None
+            self._last_score = None
+            self._update_pixmap(self._img_disp)
+        super().leaveEvent(e)
+
+    def _disp_to_img_coords(self, p: QPoint) -> Optional[Tuple[int, int]]:
+        if self._img_bgr is None:
+            return None
+        x = p.x() - self._offset_x
+        y = p.y() - self._offset_y
+        if x < 0 or y < 0:
+            return None
+        H, W = self._img_bgr.shape[:2]
+        ix = int(x / self._scale)
+        iy = int(y / self._scale)
+        if ix < 0 or iy < 0 or ix >= W or iy >= H:
+            return None
+        return ix, iy
+
     def _do_predict_hover(self):
-        # unchanged except: only run when no clicks yet
         if self._img_bgr is None or self._seg is None or self._last_mouse_pos is None:
             return
         if self._click_points:
@@ -280,12 +288,14 @@ class HoverMaskViewer(QLabel):
 
         ix, iy = pt
         try:
-            mask, score = self._seg.predict_from_points([(ix, iy)], [1])
+            mask, score = self._seg.predict_from_points([(ix, iy)], [1])  # hover = positive probe
             self._last_mask = mask
             self._last_score = score
             self._redraw_overlay()
             self._last_pred_time = now
-            self.parent().parent().show_score(score)
+            mw = self.window()
+            if hasattr(mw, "show_score"):
+                mw.show_score(score)
         except Exception as ex:
             self._hover_timer.stop()
             QMessageBox.critical(self, "Prediction Error", str(ex))
@@ -297,52 +307,86 @@ class HoverMaskViewer(QLabel):
         overlay = self._img_disp.copy()
 
         if self._last_mask is not None:
+            # Resize mask to display size for blending
             mask_disp = cv2.resize(
                 self._last_mask.astype(np.uint8),
                 (overlay.shape[1], overlay.shape[0]),
                 interpolation=cv2.INTER_NEAREST
             ).astype(bool)
 
+            # Colorize mask and alpha-blend
             color = np.array([0, 200, 200], dtype=np.uint8)  # BGR
             alpha = 0.35
             colored = np.zeros_like(overlay)
             colored[mask_disp] = color
             overlay = cv2.addWeighted(overlay, 1.0, colored, alpha, 0.0)
 
+            # Outline
             contours, _ = cv2.findContours(mask_disp.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(overlay, contours, -1, (0, 255, 255), 1)
 
-        # Draw clicked points (optional; not the moving cursor)
+        # Draw clicked points (add=green, subtract=red), mapped onto the SCALED image (no widget offsets)
         if self._show_click_markers and self._click_points:
-            H, W = overlay.shape[:2]  # overlay is the scaled image (no margins)
+            H, W = overlay.shape[:2]
             for (x, y), lab in zip(self._click_points, self._click_labels):
-                # Map ORIGINAL image coords -> SCALED image coords (no offsets here)
                 dx = int(round(x * self._scale))
                 dy = int(round(y * self._scale))
-                # clamp to image bounds
                 dx = max(0, min(W - 1, dx))
                 dy = max(0, min(H - 1, dy))
-                color = (0, 255, 0) if lab == 1 else (0, 0, 255)  # add=green, subtract=red
+                color = (0, 255, 0) if lab == 1 else (0, 0, 255)
                 cv2.circle(overlay, (dx, dy), 4, color, 2)
 
         self._update_pixmap(overlay)
 
+    def _update_pixmap(self, bgr: np.ndarray):
+        h, w = bgr.shape[:2]
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        rgb = np.require(rgb, dtype=np.uint8, requirements=["C"])
+        bytes_per_line = rgb.strides[0]
+
+        # Use tobytes() for broad PyQt compatibility (avoids memoryview TypeError)
+        self._qimage_bytes = rgb.tobytes()
+        qimg = QImage(self._qimage_bytes, w, h, bytes_per_line, QImage.Format_RGB888)
+
+        pix = QPixmap.fromImage(qimg)
+        self.setPixmap(pix)
+
+
 # -------------------- Main Window --------------------
 class MainWindow(QMainWindow):
-    def __init__(self, seg: Segmenter, img_bgr: np.ndarray, parent=None):
+    def __init__(self, seg: Segmenter, img_bgr: np.ndarray, classes: list, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("SAM2 Hover Mask Preview — PyQt5")
+        self.setWindowTitle("SAM2 Hover + Click-Refine — PyQt5")
+
         self.viewer = HoverMaskViewer(self)
         self.viewer.set_segmenter(seg)
         self.viewer.set_image(img_bgr)
 
+        # ---- right-side class list ----
+        self.class_list = QListWidget()
+        self.class_list.addItems(classes)
+        self.class_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        if self.class_list.count() > 0:
+            self.class_list.setCurrentRow(0)
+            self.viewer.set_selected_class(self.class_list.currentItem().text())
+        self.class_list.currentTextChanged.connect(self.on_class_changed)
+        self.class_list.setMinimumHeight(340)
+        side = QFrame()
+        side_layout = QVBoxLayout(side)
+        side_layout.addWidget(QLabel("Classes"))
+        side_layout.addWidget(self.class_list)
+        side.setFixedWidth(220)
+
+
+        # Central layout: image viewer (stretch) + side panel
         central = QWidget(self)
-        layout = QVBoxLayout(central)
-        layout.addWidget(self.viewer)
+        h = QHBoxLayout(central)
+        h.addWidget(self.viewer, stretch=1)
+        h.addWidget(side)
         self.setCentralWidget(central)
 
         self.status = self.statusBar()
-        self.status.showMessage("Move the mouse over the image to preview masks.")
+        self.status.showMessage("Right-click=Add, Left-click=Subtract, Z=Undo, C=Clear. Pick a class on the right.")
 
         # Menu: File -> Open Image
         act_open = QAction("Open Image…", self)
@@ -351,11 +395,18 @@ class MainWindow(QMainWindow):
 
         self.resize(1280, 800)
 
+    def on_class_changed(self, name: str):
+        self.viewer.set_selected_class(name)
+        self.show_message(f"Selected class: {name}")
+
     def show_score(self, s: Optional[float]):
         if s is None:
             self.status.clearMessage()
         else:
             self.status.showMessage(f"Mask score: {s:.3f}")
+
+    def show_message(self, msg: str):
+        self.status.showMessage(msg)
 
     def open_image(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select image", "", "Images (*.png *.jpg *.jpeg *.bmp)")
@@ -384,6 +435,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+
     # Load image (or ask)
     img_bgr = None
     if args.images:
@@ -412,7 +464,7 @@ def main():
             print(f"ERROR: Failed to read image: {path}", file=sys.stderr)
             sys.exit(2)
 
-    w = MainWindow(seg, img_bgr)
+    w = MainWindow(seg, img_bgr, classes=args.classes)
     w.show()
     sys.exit(app.exec_())
 
