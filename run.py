@@ -59,19 +59,29 @@ class Segmenter:
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         self.predictor.set_image(image_rgb)
 
-    def predict_from_point(self, x: int, y: int, positive: bool = True) -> Tuple[np.ndarray, float]:
-        """Return (mask, score). Highest-scoring mask among outputs.
-        mask: HxW bool array; score: float in [0,1]
+    def predict_from_points(self, points_xy, labels01) -> Tuple[np.ndarray, float]:
         """
-        input_point = np.array([[x, y]])
-        input_label = np.array([1 if positive else 0])
+        points_xy: List[Tuple[int,int]] or Nx2 np.array in image coords (original size)
+        labels01:  List[int] or (N,) np.array with 1 (add) or 0 (subtract)
+        Returns: (best_mask_bool, best_score_float)
+        """
+        pts = np.asarray(points_xy, dtype=np.int32)
+        if pts.ndim != 2 or pts.shape[1] != 2:
+            raise ValueError("points_xy must be Nx2")
+        labs = np.asarray(labels01, dtype=np.int32).reshape(-1)
+        if labs.shape[0] != pts.shape[0]:
+            raise ValueError("labels01 length must match points")
         masks, scores, _ = self.predictor.predict(
-            point_coords=input_point,
-            point_labels=input_label,
+            point_coords=pts.astype(np.float32),
+            point_labels=labs.astype(np.int32),
             multimask_output=True
         )
-        idx = int(np.argmax(scores))
-        return masks[idx].astype(bool), float(scores[idx])
+        i = int(np.argmax(scores))
+        return masks[i].astype(bool), float(scores[i])
+    
+    
+
+
 
 
 # -------------------- Image Viewer Widget --------------------
@@ -80,30 +90,68 @@ class HoverMaskViewer(QLabel):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setAlignment(Qt.AlignCenter)
-        self._img_bgr: Optional[np.ndarray] = None          # original image
-        self._img_disp: Optional[np.ndarray] = None         # scaled for display (BGR)
-        self._disp_qpix: Optional[QPixmap] = None
-        self._seg: Optional[Segmenter] = None
+        self.setContextMenuPolicy(Qt.NoContextMenu)  # let right-click be our add-click
+
+        self._img_bgr = None
+        self._img_disp = None
+        self._seg = None
 
         self._scale = 1.0
         self._offset_x = 0
         self._offset_y = 0
 
-        # Hover prediction throttle
         self._hover_timer = QTimer(self)
         self._hover_timer.setSingleShot(True)
-        self._hover_timer.setInterval(30)  # ms; adjust if needed
-        self._hover_timer.timeout.connect(self._do_predict)
+        self._hover_timer.setInterval(30)
+        self._hover_timer.timeout.connect(self._do_predict_hover)
 
-        self._last_mouse_pos: Optional[QPoint] = None
+        self._last_mouse_pos = None
         self._last_pred_time = 0.0
 
-        # Last overlay state
-        self._last_mask: Optional[np.ndarray] = None
-        self._last_score: Optional[float] = None
+        self._last_mask = None
+        self._last_score = None
 
-        # Cosmetic
-        self._cursor_radius = 3
+        # NEW: click history for SAM-style refinement
+        self._click_points = []   # List[(x,y)]
+        self._click_labels = []   # List[int] 1=add, 0=subtract
+
+        # Optional: draw small markers at clicked points
+        self._show_click_markers = True
+    
+    def _disp_to_img_coords(self, p: QPoint) -> Optional[Tuple[int, int]]:
+        """Map widget/display coords back to original image coords."""
+        if self._img_bgr is None:
+            return None
+        x = p.x() - self._offset_x
+        y = p.y() - self._offset_y
+        if x < 0 or y < 0:
+            return None
+        H, W = self._img_bgr.shape[:2]
+        ix = int(x / self._scale)
+        iy = int(y / self._scale)
+        if ix < 0 or iy < 0 or ix >= W or iy >= H:
+            return None
+        return ix, iy
+
+    def _update_pixmap(self, bgr: np.ndarray):
+        h, w = bgr.shape[:2]
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+        # Make sure memory is contiguous and uint8
+        rgb = np.require(rgb, dtype=np.uint8, requirements=["C"])
+
+        # bytesPerLine = stride for the first dimension
+        bytes_per_line = rgb.strides[0]
+
+        # Build QImage from the NumPy buffer
+        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+
+        # Keep a reference so the data pointer stays valid
+        self._qimage_buf = rgb
+
+        pix = QPixmap.fromImage(qimg)
+        self.setPixmap(pix)
+
 
     def set_segmenter(self, seg: Segmenter):
         self._seg = seg
@@ -146,44 +194,85 @@ class HoverMaskViewer(QLabel):
         if self._img_bgr is None or self._seg is None:
             return
         self._last_mouse_pos = e.pos()
-        # Debounce/throttle: restart a short timer; if mouse keeps moving,
-        # only predict after the timer fires.
-        self._hover_timer.start()
+        # Only do hover prediction when no refinement clicks yet
+        if len(self._click_points) == 0:
+            self._hover_timer.start()
 
-    def leaveEvent(self, e):
-        # Clear overlay when cursor leaves
-        if self._img_bgr is not None:
+    def mousePressEvent(self, e):
+        if self._img_bgr is None or self._seg is None:
+            return
+        pt_img = self._disp_to_img_coords(e.pos())
+        if pt_img is None:
+            return
+
+        # Left = subtract (0), Right = add (1)
+        if e.button() == Qt.LeftButton:
+            label = 1
+        elif e.button() == Qt.RightButton:
+            label = 0
+        else:
+            return
+
+        # Record click
+        self._click_points.append(pt_img)
+        self._click_labels.append(label)
+
+        # Predict with all points so far
+        try:
+            mask, score = self._seg.predict_from_points(self._click_points, self._click_labels)
+            self._last_mask = mask
+            self._last_score = score
+            self._redraw_overlay()
+            self.parent().parent().show_score(score)
+        except Exception as ex:
+            QMessageBox.critical(self, "Prediction Error", str(ex))
+
+    def keyPressEvent(self, e):
+        # Z: undo last point, C: clear all points
+        if e.key() in (Qt.Key_Z,):
+            if self._click_points:
+                self._click_points.pop()
+                self._click_labels.pop()
+                self._recompute_from_clicks_or_clear()
+        elif e.key() in (Qt.Key_C,):
+            self._click_points.clear()
+            self._click_labels.clear()
             self._last_mask = None
             self._last_score = None
-            self._update_pixmap(self._img_disp)
-        super().leaveEvent(e)
+            # back to hover mode
+            self._redraw_overlay()
+        else:
+            super().keyPressEvent(e)
 
-    def _disp_to_img_coords(self, p: QPoint) -> Optional[Tuple[int, int]]:
-        """Map widget/display coords back to original image coords."""
-        if self._img_bgr is None:
-            return None
-        x = p.x() - self._offset_x
-        y = p.y() - self._offset_y
-        if x < 0 or y < 0:
-            return None
-        H, W = self._img_bgr.shape[:2]
-        ix = int(x / self._scale)
-        iy = int(y / self._scale)
-        if ix < 0 or iy < 0 or ix >= W or iy >= H:
-            return None
-        return ix, iy
+    def _recompute_from_clicks_or_clear(self):
+        # Recompute current refined mask if any clicks remain; else clear and show base image
+        if self._click_points:
+            try:
+                mask, score = self._seg.predict_from_points(self._click_points, self._click_labels)
+                self._last_mask = mask
+                self._last_score = score
+                self._redraw_overlay()
+                self.parent().parent().show_score(score)
+            except Exception as ex:
+                QMessageBox.critical(self, "Prediction Error", str(ex))
+        else:
+            self._last_mask = None
+            self._last_score = None
+            self._redraw_overlay()
 
-    def _do_predict(self):
+    def _do_predict_hover(self):
+        # unchanged except: only run when no clicks yet
         if self._img_bgr is None or self._seg is None or self._last_mouse_pos is None:
             return
-        # Small additional throttle (optional)
+        if self._click_points:
+            return  # refinement in progress; skip hover
+
         now = time.time()
-        if now - self._last_pred_time < 0.02:  # 50 FPS max predictions
+        if now - self._last_pred_time < 0.02:
             return
 
         pt = self._disp_to_img_coords(self._last_mouse_pos)
         if pt is None:
-            # Outside image; clear overlay
             self._last_mask = None
             self._last_score = None
             self._update_pixmap(self._img_disp)
@@ -191,65 +280,52 @@ class HoverMaskViewer(QLabel):
 
         ix, iy = pt
         try:
-            mask, score = self._seg.predict_from_point(ix, iy, positive=True)
+            mask, score = self._seg.predict_from_points([(ix, iy)], [1])
             self._last_mask = mask
             self._last_score = score
-            self._redraw_overlay(cursor_disp_pt=self._last_mouse_pos)
+            self._redraw_overlay()
             self._last_pred_time = now
-            # Emit a signal or update parent status bar (via event) if needed
             self.parent().parent().show_score(score)
         except Exception as ex:
-            # Show once, then stop predicting to avoid spamming
             self._hover_timer.stop()
             QMessageBox.critical(self, "Prediction Error", str(ex))
 
-    def _redraw_overlay(self, cursor_disp_pt: Optional[QPoint] = None):
+    def _redraw_overlay(self):
         if self._img_disp is None:
             return
 
         overlay = self._img_disp.copy()
 
         if self._last_mask is not None:
-            # Resize mask to display size for blending
             mask_disp = cv2.resize(
                 self._last_mask.astype(np.uint8),
                 (overlay.shape[1], overlay.shape[0]),
                 interpolation=cv2.INTER_NEAREST
             ).astype(bool)
 
-            # Colorize mask and alpha-blend
             color = np.array([0, 200, 200], dtype=np.uint8)  # BGR
             alpha = 0.35
             colored = np.zeros_like(overlay)
             colored[mask_disp] = color
             overlay = cv2.addWeighted(overlay, 1.0, colored, alpha, 0.0)
 
-            # Optional outline
             contours, _ = cv2.findContours(mask_disp.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(overlay, contours, -1, (0, 255, 255), 1)
 
+        # Draw clicked points (optional; not the moving cursor)
+        if self._show_click_markers and self._click_points:
+            H, W = overlay.shape[:2]  # overlay is the scaled image (no margins)
+            for (x, y), lab in zip(self._click_points, self._click_labels):
+                # Map ORIGINAL image coords -> SCALED image coords (no offsets here)
+                dx = int(round(x * self._scale))
+                dy = int(round(y * self._scale))
+                # clamp to image bounds
+                dx = max(0, min(W - 1, dx))
+                dy = max(0, min(H - 1, dy))
+                color = (0, 255, 0) if lab == 1 else (0, 0, 255)  # add=green, subtract=red
+                cv2.circle(overlay, (dx, dy), 4, color, 2)
+
         self._update_pixmap(overlay)
-
-
-    def _update_pixmap(self, bgr: np.ndarray):
-        h, w = bgr.shape[:2]
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-        # Make sure memory is contiguous and uint8
-        rgb = np.require(rgb, dtype=np.uint8, requirements=["C"])
-
-        # bytesPerLine = stride for the first dimension
-        bytes_per_line = rgb.strides[0]
-
-        # Build QImage from the NumPy buffer
-        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-
-        # Keep a reference so the data pointer stays valid
-        self._qimage_buf = rgb
-
-        pix = QPixmap.fromImage(qimg)
-        self.setPixmap(pix)
-
 
 # -------------------- Main Window --------------------
 class MainWindow(QMainWindow):
