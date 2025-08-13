@@ -1,0 +1,6 @@
+segment-anything-2-real-time/*
+venv
+models
+images
+mobileclip_blt.ts
+*__pycache__
