@@ -209,6 +209,7 @@ class HoverMaskViewer(QLabel):
         obj_idx = self._hit_test_object(ix, iy)
         if obj_idx is not None:
             obj = self._objects.pop(obj_idx)  # remove from frozen so it won't double-draw
+            
             # Restore its clicks/labels so user can refine
             self._click_points = [(c.x, c.y) for c in obj.clicks]
             self._click_labels = [c.label for c in obj.clicks]
@@ -218,6 +219,8 @@ class HoverMaskViewer(QLabel):
             # Do NOT treat this click as an add/subtract action; just enter edit mode
             self._redraw_overlay()
             mw = self.window()
+            if hasattr(mw, "update_saved_count"):
+                mw.update_saved_count()
             if hasattr(mw, "show_message"):
                 mw.show_message(f"Editing previously saved object (class '{obj.class_name}').")
             if hasattr(mw, "set_selected_class_name"):
@@ -265,6 +268,15 @@ class HoverMaskViewer(QLabel):
             mw = self.window()
             if hasattr(mw, "class_list"):
                 mw.class_list.clearSelection()
+        elif e.key() in (Qt.Key_Delete,):
+    # If we’re editing a committed object, delete it
+            if self._editing_original is not None:
+                self.delete_editing_object()
+            else:
+                if self._click_points:
+                    self._click_points.pop()
+                    self._click_labels.pop()
+                    self._recompute_from_clicks_or_clear()
         else:
             super().keyPressEvent(e)
 
@@ -278,7 +290,7 @@ class HoverMaskViewer(QLabel):
             self._objects.append(self._editing_original)
             restored_class = self._editing_original.class_name
             self._editing_original = None
-
+            
             # Clear any in-progress edits
             self._click_points.clear()
             self._click_labels.clear()
@@ -289,11 +301,41 @@ class HoverMaskViewer(QLabel):
 
             # (Optional) highlight its class again
             mw = self.window()
+            if hasattr(mw, "update_saved_count"):
+                mw.update_saved_count()
             if hasattr(mw, "set_selected_class_name"):
                 mw.set_selected_class_name(restored_class, announce=False)
         else:
             # No edit-in-progress; just clear pending (keeps committed visible)
             self.clear_pending()
+
+    def delete_editing_object(self):
+        """
+        If we're editing a previously committed object (after clicking it),
+        delete it permanently (do NOT restore it), and clear any pending state.
+        """
+        if self._editing_original is None:
+            return  # nothing to delete
+
+        deleted_class = self._editing_original.class_name
+        # The object was already popped from _objects when we entered edit mode.
+        self._editing_original = None
+
+        # Clear any in-progress points/mask/score
+        self._click_points.clear()
+        self._click_labels.clear()
+        self._last_mask = None
+        self._last_score = None
+
+        # Redraw shows only the remaining committed objects
+        self._redraw_overlay()
+
+        # Update UI counters/messages if available
+        mw = self.window()
+        if hasattr(mw, "update_saved_count"):
+            mw.update_saved_count()
+        if hasattr(mw, "show_message"):
+            mw.show_message(f"Deleted committed object ('{deleted_class}').")
 
 
     def _recompute_from_clicks_or_clear(self):
@@ -599,6 +641,8 @@ class MainWindow(QMainWindow):
         else:
             self.viewer.set_selected_class(name)
             self.show_message(f"Selected class: {name}")
+    def update_saved_count(self):
+        self.saved_label.setText(f"Saved: {self.viewer.get_object_count()}")
 
     def set_selected_class_name(self, name: str, announce: bool = True):
         # Programmatically highlight the class; does NOT trigger itemClicked.
