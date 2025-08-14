@@ -201,27 +201,47 @@ class HoverMaskViewer(QLabel):
         pt_img = self._disp_to_img_coords(e.pos())
         if pt_img is None:
             return
+        ix, iy = pt_img
 
-        # Left = subtract (0), Right = add (1)
+        # If user clicks on a FROZEN object, pull it back into edit mode.
+        obj_idx = self._hit_test_object(ix, iy)
+        if obj_idx is not None:
+            obj = self._objects.pop(obj_idx)  # remove from frozen so it won't double-draw
+            # Restore its clicks/labels so user can refine
+            self._click_points = [(c.x, c.y) for c in obj.clicks]
+            self._click_labels = [c.label for c in obj.clicks]
+            self._last_mask = obj.mask.astype(bool)
+            self._last_score = obj.score
+            # Do NOT treat this click as an add/subtract action; just enter edit mode
+            self._redraw_overlay()
+            mw = self.window()
+            if hasattr(mw, "show_message"):
+                mw.show_message(f"Editing previously saved object (class '{obj.class_name}').")
+            if hasattr(mw, "set_selected_class_name"):
+                mw.set_selected_class_name(obj.class_name, announce=True)
+            return
+
+        # Otherwise, normal add/subtract behavior on current (pending) object
         if e.button() == Qt.LeftButton:
-            label = 1
+            label = 1  # add
         elif e.button() == Qt.RightButton:
-            label = 0
+            label = 0  # sub
         else:
             return
 
-        self._click_points.append(pt_img)
+        self._click_points.append((ix, iy))
         self._click_labels.append(label)
         try:
             mask, score = self._seg.predict_from_points(self._click_points, self._click_labels)
             self._last_mask = mask
-            self._last_score = score
+            self._last_score = float(score)
             self._redraw_overlay()
             mw = self.window()
             if hasattr(mw, "show_score"):
-                mw.show_score(score)
+                mw.show_score(self._last_score)
         except Exception as ex:
             QMessageBox.critical(self, "Prediction Error", str(ex))
+
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Z:
@@ -300,11 +320,13 @@ class HoverMaskViewer(QLabel):
 
 
     def leaveEvent(self, e):
-        if self._img_bgr is not None and not self._click_points:
+    # Clear ONLY the hover/pending preview; keep frozen objects visible.
+        if self._img_bgr is not None:
             self._last_mask = None
             self._last_score = None
-            self._update_pixmap(self._img_disp)
+            self._redraw_overlay()   # <- draws frozen objects
         super().leaveEvent(e)
+
 
     def _disp_to_img_coords(self, p: QPoint) -> Optional[Tuple[int, int]]:
         if self._img_bgr is None:
@@ -319,17 +341,67 @@ class HoverMaskViewer(QLabel):
         if ix < 0 or iy < 0 or ix >= W or iy >= H:
             return None
         return ix, iy
+    
+    def _hit_test_object(self, ix: int, iy: int) -> Optional[int]:
+        """Return index of the topmost frozen object whose mask contains (ix, iy); else None."""
+        if not self._objects:
+            return None
+        # Iterate from last to first so the most-recently saved object is "on top"
+        for idx in range(len(self._objects) - 1, -1, -1):
+            obj = self._objects[idx]
+            m = obj.mask
+            # Bounds check (should match original image size)
+            if 0 <= iy < m.shape[0] and 0 <= ix < m.shape[1]:
+                if bool(m[iy, ix]):
+                    return idx
+        return None
+
+    def commit_current_object(self, class_name: str) -> Optional[ObjRecord]:
+        """
+        Save the current refined object (clicks + labels + score + mask) under class_name,
+        clear pending state, and return the saved record. The saved object remains visible (frozen).
+        """
+        if not self._click_points:
+            return None
+
+        # Compute final mask + score from current clicks
+        try:
+            mask, score = self._seg.predict_from_points(self._click_points, self._click_labels)
+            self._last_mask = mask
+            self._last_score = float(score)
+        except Exception:
+            if self._last_mask is None:
+                return None
+            # Score may be None if something failed; default to 0.0
+            self._last_score = float(self._last_score or 0.0)
+
+        clicks = [Click(x=xy[0], y=xy[1], label=lb)
+                for xy, lb in zip(self._click_points, self._click_labels)]
+
+        rec = ObjRecord(
+            class_name=class_name,
+            clicks=clicks,
+            score=float(self._last_score or 0.0),
+            mask=self._last_mask.astype(bool)
+        )
+        self._objects.append(rec)
+
+        # Freeze: clear pending so a new object can begin
+        self._click_points.clear()
+        self._click_labels.clear()
+        self._last_mask = None
+        self._last_score = None
+        self._redraw_overlay()
+        return rec
 
     def _do_predict_hover(self):
         if self._img_bgr is None or self._seg is None or self._last_mouse_pos is None:
             return
 
-        # Throttle
         now = time.time()
         if now - self._last_pred_time < 0.02:
             return
 
-        # Map cursor to ORIGINAL image coords
         pt = self._disp_to_img_coords(self._last_mouse_pos)
         if pt is None:
             self._last_mask = None
@@ -337,23 +409,23 @@ class HoverMaskViewer(QLabel):
             self._update_pixmap(self._img_disp)
             return
 
-        # Combine existing clicks + hover point (hover = positive probe)
+        # Combine existing clicks + hover probe (1 = positive)
         points_xy = list(self._click_points) + [pt]
         labels01  = list(self._click_labels) + [1]
 
         try:
             mask, score = self._seg.predict_from_points(points_xy, labels01)
             self._last_mask = mask
-            self._last_score = score
+            self._last_score = float(score)
             self._redraw_overlay()
             self._last_pred_time = now
-
             mw = self.window()
             if hasattr(mw, "show_score"):
-                mw.show_score(score)
+                mw.show_score(self._last_score)
         except Exception as ex:
             self._hover_timer.stop()
             QMessageBox.critical(self, "Prediction Error", str(ex))
+
 
 
     def _redraw_overlay(self):
@@ -362,38 +434,51 @@ class HoverMaskViewer(QLabel):
 
         overlay = self._img_disp.copy()
 
+        # --- Draw FROZEN objects (from history) ---
+        if self._objects:
+            for obj in self._objects:
+                mask_disp = cv2.resize(
+                    obj.mask.astype(np.uint8),
+                    (overlay.shape[1], overlay.shape[0]),
+                    interpolation=cv2.INTER_NEAREST
+                ).astype(bool)
+                # color overlay for frozen objects (cyan-ish)
+                frozen_color = np.array([0, 200, 200], dtype=np.uint8)  # BGR
+                frozen_alpha = 0.25
+                colored = np.zeros_like(overlay)
+                colored[mask_disp] = frozen_color
+                overlay = cv2.addWeighted(overlay, 1.0, colored, frozen_alpha, 0.0)
+                # outline
+                contours, _ = cv2.findContours(mask_disp.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(overlay, contours, -1, (0, 255, 255), 1)
+
+        # --- Draw current (pending) object mask, if any ---
         if self._last_mask is not None:
-            # Resize mask to display size for blending
             mask_disp = cv2.resize(
                 self._last_mask.astype(np.uint8),
                 (overlay.shape[1], overlay.shape[0]),
                 interpolation=cv2.INTER_NEAREST
             ).astype(bool)
-
-            # Colorize mask and alpha-blend
-            color = np.array([0, 200, 200], dtype=np.uint8)  # BGR
-            alpha = 0.35
+            pending_color = np.array([0, 180, 0], dtype=np.uint8)  # greenish for current
+            pending_alpha = 0.35
             colored = np.zeros_like(overlay)
-            colored[mask_disp] = color
-            overlay = cv2.addWeighted(overlay, 1.0, colored, alpha, 0.0)
-
-            # Outline
+            colored[mask_disp] = pending_color
+            overlay = cv2.addWeighted(overlay, 1.0, colored, pending_alpha, 0.0)
+            # outline
             contours, _ = cv2.findContours(mask_disp.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(overlay, contours, -1, (0, 255, 255), 1)
+            cv2.drawContours(overlay, contours, -1, (0, 255, 0), 2)
 
-        # Draw clicked points (add=green, subtract=red), mapped onto the SCALED image (no widget offsets)
+        # Click markers for the pending object (scaled; no widget offsets)
         if self._show_click_markers and self._click_points:
             H, W = overlay.shape[:2]
             for (x, y), lab in zip(self._click_points, self._click_labels):
-                dx = int(round(x * self._scale))
-                dy = int(round(y * self._scale))
-                dx = max(0, min(W - 1, dx))
-                dy = max(0, min(H - 1, dy))
+                dx = int(round(x * self._scale)); dy = int(round(y * self._scale))
+                dx = max(0, min(W - 1, dx)); dy = max(0, min(H - 1, dy))
                 color = (0, 255, 0) if lab == 1 else (0, 0, 255)
                 cv2.circle(overlay, (dx, dy), 4, color, 2)
 
         self._update_pixmap(overlay)
-
+    
     def _update_pixmap(self, bgr: np.ndarray):
         h, w = bgr.shape[:2]
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -422,16 +507,19 @@ class MainWindow(QMainWindow):
         self.class_list = QListWidget()
         self.class_list.addItems(classes)
         self.class_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        if self.class_list.count() > 0:
-            self.class_list.setCurrentRow(0)
-            self.viewer.set_selected_class(self.class_list.currentItem().text())
-        self.class_list.currentTextChanged.connect(self.on_class_changed)
+        self.class_list.clearSelection()
+        self.class_list.itemClicked.connect(self.on_class_clicked)
         self.class_list.setMinimumHeight(340)
+
+        
+
         side = QFrame()
         side_layout = QVBoxLayout(side)
         side_layout.addWidget(QLabel("Classes"))
         side_layout.addWidget(self.class_list)
         side.setFixedWidth(220)
+        self.saved_label = QLabel("Saved: 0")
+        side_layout.addWidget(self.saved_label)
 
 
         # Central layout: image viewer (stretch) + side panel
@@ -442,8 +530,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.status = self.statusBar()
-        self.status.showMessage("Right-click=Add, Left-click=Subtract, Z=Undo, C=Clear. Pick a class on the right.")
-
+        self.status.showMessage(
+            "Hover previews (+pending). Right-click=Add, Left-click=Subtract, Z=Undo, C=Clear. "
+            "Click a class to SAVE. Click a frozen object to EDIT."
+        )
         # Menu: File -> Open Image
         act_open = QAction("Open Image…", self)
         act_open.triggered.connect(self.open_image)
@@ -451,15 +541,39 @@ class MainWindow(QMainWindow):
 
         self.resize(1280, 800)
 
-    def on_class_changed(self, name: str):
-        self.viewer.set_selected_class(name)
-        self.show_message(f"Selected class: {name}")
-
     def show_score(self, s: Optional[float]):
         if s is None:
             self.status.clearMessage()
         else:
             self.status.showMessage(f"Mask score: {s:.3f}")
+    
+    def on_class_clicked(self, item):
+        name = item.text()
+        if self.viewer.has_pending():
+            rec = self.viewer.commit_current_object(name)
+            if rec is not None:
+                self.update_saved_count()
+                self.class_list.clearSelection()
+                self.show_message(f"Saved object #{self.viewer.get_object_count()} as '{name}'.")
+        else:
+            self.viewer.set_selected_class(name)
+            self.show_message(f"Selected class: {name}")
+
+    def set_selected_class_name(self, name: str, announce: bool = True):
+        # Programmatically highlight the class; does NOT trigger itemClicked.
+        for row in range(self.class_list.count()):
+            if self.class_list.item(row).text() == name:
+                self.class_list.setCurrentRow(row)
+                break
+        # Let the viewer know too (optional but handy)
+        self.viewer.set_selected_class(name)
+        if announce:
+            self.show_message(f"Editing object (class '{name}')")
+
+
+    def update_saved_count(self):
+        self.saved_label.setText(f"Saved: {self.viewer.get_object_count()}")
+
 
     def show_message(self, msg: str):
         self.status.showMessage(msg)
