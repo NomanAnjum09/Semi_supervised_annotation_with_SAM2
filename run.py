@@ -191,8 +191,9 @@ class HoverMaskViewer(QLabel):
         if self._img_bgr is None or self._seg is None:
             return
         self._last_mouse_pos = e.pos()
-        if len(self._click_points) == 0:
-            self._hover_timer.start()
+        # Always run hover preview (even if we already have clicks for this object)
+        self._hover_timer.start()
+
 
     def mousePressEvent(self, e):
         if self._img_bgr is None or self._seg is None:
@@ -322,13 +323,13 @@ class HoverMaskViewer(QLabel):
     def _do_predict_hover(self):
         if self._img_bgr is None or self._seg is None or self._last_mouse_pos is None:
             return
-        if self._click_points:
-            return  # refinement in progress; skip hover
 
+        # Throttle
         now = time.time()
         if now - self._last_pred_time < 0.02:
             return
 
+        # Map cursor to ORIGINAL image coords
         pt = self._disp_to_img_coords(self._last_mouse_pos)
         if pt is None:
             self._last_mask = None
@@ -336,19 +337,24 @@ class HoverMaskViewer(QLabel):
             self._update_pixmap(self._img_disp)
             return
 
-        ix, iy = pt
+        # Combine existing clicks + hover point (hover = positive probe)
+        points_xy = list(self._click_points) + [pt]
+        labels01  = list(self._click_labels) + [1]
+
         try:
-            mask, score = self._seg.predict_from_points([(ix, iy)], [1])  # hover = positive probe
+            mask, score = self._seg.predict_from_points(points_xy, labels01)
             self._last_mask = mask
             self._last_score = score
             self._redraw_overlay()
             self._last_pred_time = now
+
             mw = self.window()
             if hasattr(mw, "show_score"):
                 mw.show_score(score)
         except Exception as ex:
             self._hover_timer.stop()
             QMessageBox.critical(self, "Prediction Error", str(ex))
+
 
     def _redraw_overlay(self):
         if self._img_disp is None:
