@@ -43,7 +43,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QMessageBox, QAction,
     QListWidget, QAbstractItemView, QFrame
 )
-
+from src.helpers import ObjRecord,Click
 # -------------------- SAM / SAM2 loader --------------------
 class Segmenter:
     def __init__(self, ckpt_path: str, config: str, device: str = None):
@@ -140,6 +140,9 @@ class HoverMaskViewer(QLabel):
 
         # keep reference to bytes for QImage
         self._qimage_bytes = None
+        
+        #history
+        self._objects: list[ObjRecord] = []
 
     def set_segmenter(self, seg: Segmenter):
         self._seg = seg
@@ -154,11 +157,14 @@ class HoverMaskViewer(QLabel):
         self._prepare_display_image()
         if self._seg:
             self._seg.set_image(self._img_bgr)
+        # clear pending and history
         self._last_mask = None
         self._last_score = None
         self._click_points.clear()
         self._click_labels.clear()
+        self._objects.clear()
         self._update_pixmap(self._img_disp)
+
 
     def _prepare_display_image(self):
         if self._img_bgr is None:
@@ -247,6 +253,50 @@ class HoverMaskViewer(QLabel):
             self._last_mask = None
             self._last_score = None
             self._redraw_overlay()
+    
+        # ---- history / commit API ----
+    def has_pending(self) -> bool:
+        """Do we have a mask-in-progress (clicks recorded but not saved)?"""
+        return len(self._click_points) > 0
+
+    def commit_current_object(self, class_name: str) -> Optional[ObjRecord]:
+        """
+        Save the current refined object (clicks + labels + score) under class_name,
+        clear pending state, and return the saved record.
+        """
+        if not self._click_points:
+            return None
+
+        # Ensure we have the latest score
+        if self._last_score is None:
+            try:
+                _, score = self._seg.predict_from_points(self._click_points, self._click_labels)
+                self._last_score = score
+            except Exception:
+                self._last_score = 0.0
+
+        clicks = [Click(x=xy[0], y=xy[1], label=lb)
+                  for xy, lb in zip(self._click_points, self._click_labels)]
+        rec = ObjRecord(class_name=class_name,
+                        clicks=clicks,
+                        score=float(self._last_score or 0.0))
+        self._objects.append(rec)
+
+        # Clear pending for next object
+        self._click_points.clear()
+        self._click_labels.clear()
+        self._last_mask = None
+        self._last_score = None
+        self._redraw_overlay()
+        return rec
+
+    def get_object_count(self) -> int:
+        return len(self._objects)
+
+    def get_history(self) -> list[ObjRecord]:
+        """Return a copy of the saved objects list."""
+        return list(self._objects)
+
 
     def leaveEvent(self, e):
         if self._img_bgr is not None and not self._click_points:
