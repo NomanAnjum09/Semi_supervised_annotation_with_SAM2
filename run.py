@@ -396,34 +396,6 @@ class HoverMaskViewer(QLabel):
                 if bool(m[iy, ix]):
                     return idx
         return None
-    
-    def cancel_edit_or_clear_pending(self):
-        """
-        If editing a previously committed object, restore it unchanged and exit edit mode.
-        Otherwise, clear the in-progress (uncommitted) clicks/mask/score.
-        """
-        if self._editing_original is not None:
-            # Put the original back exactly as it was
-            self._objects.append(self._editing_original)
-            restored_class = self._editing_original.class_name
-            self._editing_original = None
-
-            # Clear any in-progress edits
-            self._click_points.clear()
-            self._click_labels.clear()
-            self._last_mask = None
-            self._last_score = None
-
-            self._redraw_overlay()
-
-            # (Optional) highlight its class again
-            mw = self.window()
-            if hasattr(mw, "set_selected_class_name"):
-                mw.set_selected_class_name(restored_class, announce=False)
-        else:
-            # No edit-in-progress; just clear pending (keeps committed visible)
-            self.clear_pending()
-
 
     def commit_current_object(self, class_name: str) -> Optional[ObjRecord]:
         """
