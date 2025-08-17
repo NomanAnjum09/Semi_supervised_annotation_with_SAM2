@@ -1,21 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
-"""
-PyQt5 SAM2 UI — Hover to preview masks; right-click add / left-click subtract.
-Right panel shows a single-select class list from --classes.
-
-Run:
-  python sam2_hover_preview.py \
-      --ckpt /path/to/sam2_checkpoint.pt \
-      --config configs/sam2.1/sam2.1_hiera_l.yaml \
-      --image /path/to/image.jpg \
-      --classes A1 A2 A3 A4 A5 A6 B1 B2 B3 B4 B5 B6 C1 C2 C3 C4 C5 C6
-
-Shortcuts:
-  Z = undo last click
-  C = clear all clicks (return to hover mode)
-"""
 
 import os, os.path as osp
 os.environ.pop("QT_PLUGIN_PATH", None)                 # avoid cv2's plugin dir
