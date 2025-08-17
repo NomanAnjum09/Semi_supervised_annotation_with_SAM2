@@ -24,7 +24,11 @@ This app uses the SAM2 backend from: https://github.com/Gy920/segment-anything-2
 🎬 Demo
 -------
 
-▶️ **YouTube:** [SAM2 Interactive & Propagation UI](https://www.youtube.com/watch?v=XXXXXXXXXXX) (Replace with your actual demo link.)
+▶️ **YouTube:** 
+
+[![Watch the video](https://img.youtube.com/vi/I1uTubkGndo/0.jpg)](https://www.youtube.com/watch?v=I1uTubkGndo)
+
+Click Thumbnail to see demo on youtube.
 
 * * *
 
