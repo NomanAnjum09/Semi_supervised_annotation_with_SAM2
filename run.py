@@ -44,7 +44,7 @@ from PyQt5.QtWidgets import (
     QListWidget, QAbstractItemView, QFrame, QListWidgetItem, QPushButton
 )
 
-from src.helpers import ObjRecord,Click, list_image_paths, load_yolo_seg, mask_to_yolo_lines, contours_to_yolo_line,save_yolo_seg
+from src.helpers import ObjRecord,Click, list_image_paths, load_yolo_seg, mask_to_yolo_lines, merge_yolo_seg
 from src.sam_helper import Sam2Helper
 # -------------------- SAM / SAM2 loader --------------------
 
@@ -887,7 +887,7 @@ class MainWindow(QMainWindow):
 
                 yolo_lines = self._yolo_lines_from_logits_list(out_obj_ids, out_mask_logits_or_err, obj_id_to_class_id)
                 txt_path = os.path.splitext(path)[0] + ".txt"
-                save_yolo_seg(txt_path, yolo_lines)
+                merge_yolo_seg(txt_path, yolo_lines, dedup=True)
                 wrote += 1
 
         return wrote

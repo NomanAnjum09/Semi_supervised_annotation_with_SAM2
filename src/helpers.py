@@ -18,14 +18,6 @@ class ObjRecord:
     mask: np.ndarray
 
 
-
-
-def save_yolo_seg(txt_path: str, lines: list[str]):
-    os.makedirs(os.path.dirname(txt_path), exist_ok=True)
-    with open(txt_path, "w", encoding="utf-8") as f:
-        for ln in lines:
-            f.write(ln.rstrip() + "\n")
-
 def contours_to_yolo_line(class_id: int, cnt: np.ndarray, w: int, h: int) -> Optional[str]:
     # cnt: Nx1x2 int points. Return None if too small.
     if cnt is None or len(cnt) < 3:
@@ -94,4 +86,38 @@ def list_image_paths(folder: str) -> list[str]:
             files.append(osp.join(folder, name))
     return files
 
+def merge_yolo_seg(txt_path: str, new_lines: list[str], dedup: bool = True):
+    """
+    Read existing YOLO-seg labels (if any), append new_lines, and write back.
+    If dedup=True, exact duplicate lines are removed (string match).
+    """
+    existing: list[str] = []
+    if os.path.isfile(txt_path):
+        with open(txt_path, "r", encoding="utf-8") as f:
+            existing = [ln.rstrip("\n") for ln in f if ln.strip()]
 
+    if not new_lines:
+        # Nothing to add; keep existing as-is
+        if not os.path.isfile(txt_path):
+            # no file → nothing to write
+            return
+        with open(txt_path, "w", encoding="utf-8") as f:
+            for ln in existing:
+                f.write(ln + "\n")
+        return
+
+    merged = existing + [ln.rstrip("\n") for ln in new_lines if ln.strip()]
+
+    if dedup:
+        # exact string-level dedup while preserving order
+        seen = set()
+        uniq = []
+        for ln in merged:
+            if ln not in seen:
+                seen.add(ln)
+                uniq.append(ln)
+        merged = uniq
+
+    with open(txt_path, "w", encoding="utf-8") as f:
+        for ln in merged:
+            f.write(ln + "\n")
