@@ -41,66 +41,12 @@ from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QLabel, QMainWindow, QFileDialog, QWidget,
     QVBoxLayout, QHBoxLayout, QMessageBox, QAction,
-    QListWidget, QAbstractItemView, QFrame
+    QListWidget, QAbstractItemView, QFrame, QListWidgetItem, QPushButton
 )
-from src.helpers import ObjRecord,Click
+
+from src.helpers import ObjRecord,Click, list_image_paths, load_yolo_seg, mask_to_yolo_lines, contours_to_yolo_line,save_yolo_seg
+from src.sam_helper import Sam2Helper
 # -------------------- SAM / SAM2 loader --------------------
-class Segmenter:
-    def __init__(self, ckpt_path: str, config: str, device: str = None):
-        self.device = device or ("cuda" if self._torch_cuda_available() else "cpu")
-        self.kind = None  # "sam2"
-        self.predictor = None
-        self._init_model(ckpt_path, config)
-
-    def _torch_cuda_available(self) -> bool:
-        try:
-            import torch  # noqa
-            return torch.cuda.is_available()
-        except Exception:
-            return False
-
-    def _init_model(self, ckpt_path: str, config: str):
-        try:
-            from sam2.build_sam import build_sam2
-            from sam2.sam2_image_predictor import SAM2ImagePredictor
-            sam2 = build_sam2(config, ckpt_path)
-            sam2.to(self.device)
-            self.predictor = SAM2ImagePredictor(sam2)
-            self.kind = "sam2"
-            return
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to initialize SAM2. Ensure packages/checkpoint/config are correct. Error: {e}"
-            )
-
-    def set_image(self, image_bgr: np.ndarray):
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        self.predictor.set_image(image_rgb)
-
-    # Multi-point (add/subtract) refinement
-    def predict_from_points(self, points_xy, labels01) -> Tuple[np.ndarray, float]:
-        """
-        points_xy: List[(x,y)] or Nx2 array, ORIGINAL image coords
-        labels01:  List[int] (1=add, 0=subtract)
-        """
-        pts = np.asarray(points_xy, dtype=np.float32)
-        if pts.ndim != 2 or pts.shape[1] != 2:
-            raise ValueError("points_xy must be Nx2")
-        labs = np.asarray(labels01, dtype=np.int32).reshape(-1)
-        if labs.shape[0] != pts.shape[0]:
-            raise ValueError("labels01 length must match points")
-        masks, scores, _ = self.predictor.predict(
-            point_coords=pts,
-            point_labels=labs,
-            multimask_output=True
-        )
-        i = int(np.argmax(scores))
-        return masks[i].astype(bool), float(scores[i])
-
-    # Optional wrapper for single-point use
-    def predict_from_point(self, x: int, y: int, positive: bool = True) -> Tuple[np.ndarray, float]:
-        return self.predict_from_points([(x, y)], [1 if positive else 0])
-
 
 # -------------------- Image Viewer --------------------
 class HoverMaskViewer(QLabel):
@@ -113,7 +59,7 @@ class HoverMaskViewer(QLabel):
 
         self._img_bgr: Optional[np.ndarray] = None
         self._img_disp: Optional[np.ndarray] = None
-        self._seg: Optional[Segmenter] = None
+        self._seg: Optional[Sam2Helper] = None
 
         self._scale = 1.0
         self._offset_x = 0
@@ -145,7 +91,7 @@ class HoverMaskViewer(QLabel):
         self._objects: list[ObjRecord] = []
         self._editing_original: Optional[ObjRecord] = None
 
-    def set_segmenter(self, seg: Segmenter):
+    def set_segmenter(self, seg: Sam2Helper):
         self._seg = seg
 
     def set_selected_class(self, name: Optional[str]):
@@ -359,6 +305,22 @@ class HoverMaskViewer(QLabel):
     def has_pending(self) -> bool:
         """Do we have a mask-in-progress (clicks recorded but not saved)?"""
         return len(self._click_points) > 0
+    def clear_pending(self):
+        """
+        Clear any in-progress (uncommitted) clicks/mask/score,
+        but keep the committed objects intact.
+        """
+        self._click_points.clear()
+        self._click_labels.clear()
+        self._last_mask = None
+        self._last_score = None
+        self._editing_original = None
+        self._redraw_overlay()
+
+        # Optionally tell the MainWindow to update UI
+        mw = self.window()
+        if hasattr(mw, "show_score"):
+            mw.show_score(None)
 
     def commit_current_object(self, class_name: str) -> Optional[ObjRecord]:
         """
@@ -575,12 +537,56 @@ class HoverMaskViewer(QLabel):
         pix = QPixmap.fromImage(qimg)
         self.setPixmap(pix)
 
+    
+    def load_yolo_annotations(self, txt_path: str, class_names: list[str]):
+        """
+        Load YOLO segmentation (if present) and render as frozen objects.
+        Clears any pending/editing state.
+        """
+        if self._img_bgr is None:
+            return
+        H, W = self._img_bgr.shape[:2]
+        recs = []
+        pairs = load_yolo_seg(txt_path)  # list[(class_id, norm_coords)]
+        for cls_id, norm in pairs:
+            if cls_id < 0 or cls_id >= len(class_names):
+                continue
+            # to pixel polygon
+            pix = np.zeros((norm.shape[0], 2), dtype=np.int32)
+            pix[:, 0] = np.clip(np.round(norm[:, 0] * W), 0, W - 1).astype(np.int32)
+            pix[:, 1] = np.clip(np.round(norm[:, 1] * H), 0, H - 1).astype(np.int32)
+
+            # rasterize polygon to mask
+            m = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(m, [pix.reshape(-1, 1, 2)], 1)
+            recs.append(ObjRecord(
+                class_name=class_names[cls_id],
+                clicks=[],  # unknown from disk
+                score=0.0,
+                mask=m.astype(bool)
+            ))
+
+        # replace history with loaded objects
+        self._objects = recs
+        self._click_points.clear()
+        self._click_labels.clear()
+        self._last_mask = None
+        self._last_score = None
+        self._editing_original = None
+        self._redraw_overlay()
+
+
 
 # -------------------- Main Window --------------------
 class MainWindow(QMainWindow):
-    def __init__(self, seg: Segmenter, img_bgr: np.ndarray, classes: list, parent=None):
+    def __init__(self, seg: Sam2Helper, img_bgr: np.ndarray, classes: list, parent=None,
+                 images_dir: Optional[str] = None, image_paths: Optional[list] = None):
         super().__init__(parent)
         self.setWindowTitle("SAM2 Hover + Click-Refine — PyQt5")
+
+        self._images_dir = images_dir
+        self._image_paths = image_paths or []
+        self._current_image_path: Optional[str] = None
 
         self.viewer = HoverMaskViewer(self)
         self.viewer.set_segmenter(seg)
@@ -592,18 +598,31 @@ class MainWindow(QMainWindow):
         self.class_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.class_list.clearSelection()
         self.class_list.itemClicked.connect(self.on_class_clicked)
-        self.class_list.setMinimumHeight(340)
+        self.class_list.setMinimumHeight(220)
 
-        
-
+        # ---- images list (loaded on demand) ----
+        self.image_list = QListWidget()
+        self.image_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.image_list.itemClicked.connect(self.on_image_clicked)
+        # Populate only filenames, store full path in item data
+        for p in (self._image_paths or []):
+            item_text = osp.basename(p)
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, p)
+            self.image_list.addItem(item)
+        self.propagate_btn = QPushButton("Propagate")
+        self.propagate_btn.clicked.connect(self.on_propagate_clicked)
         side = QFrame()
         side_layout = QVBoxLayout(side)
         side_layout.addWidget(QLabel("Classes"))
         side_layout.addWidget(self.class_list)
-        side.setFixedWidth(220)
         self.saved_label = QLabel("Saved: 0")
         side_layout.addWidget(self.saved_label)
+        side_layout.addWidget(QLabel("Images"))
+        side_layout.addWidget(self.image_list)
+        side_layout.addWidget(self.propagate_btn)
 
+        side.setFixedWidth(260)
 
         # Central layout: image viewer (stretch) + side panel
         central = QWidget(self)
@@ -617,6 +636,7 @@ class MainWindow(QMainWindow):
             "Hover previews (+pending). Right-click=Add, Left-click=Subtract, Z=Undo, C=Clear. "
             "Click a class to SAVE. Click a frozen object to EDIT."
         )
+
         # Menu: File -> Open Image
         act_open = QAction("Open Image…", self)
         act_open.triggered.connect(self.open_image)
@@ -624,12 +644,96 @@ class MainWindow(QMainWindow):
 
         self.resize(1280, 800)
 
+        # If we have a list of images, select the first (loads on demand)
+        if self._image_paths:
+            self.select_image_index(0)
+
+    # -------- image loading on demand --------
+    def select_image_index(self, idx: int):
+        if idx < 0 or idx >= self.image_list.count():
+            return
+        item = self.image_list.item(idx)
+        if item is None:
+            return
+        self.image_list.setCurrentRow(idx)
+        path = item.data(Qt.UserRole)
+        self._load_image_path(path)
+
+    def on_image_clicked(self, item):
+        path = item.data(Qt.UserRole)
+        self._load_image_path(path)
+
+    def _load_image_path(self, path: str):
+        if not path or not osp.isfile(path):
+            QMessageBox.critical(self, "Error", f"Image not found:\n{path}")
+            return
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            QMessageBox.critical(self, "Error", f"Failed to read image:\n{path}")
+            return
+
+        self.viewer.set_image(img)  # resets pending + history
+        self._current_image_path = path
+
+        # Load YOLO labels if present
+        txt_path = osp.splitext(path)[0] + ".txt"
+        try:
+            self.viewer.load_yolo_annotations(txt_path, [self.class_list.item(i).text() for i in range(self.class_list.count())])
+        except Exception as ex:
+            # Non-fatal: just show a message
+            self.show_message(f"Note: failed to load labels for {path}: {ex}")
+
+        self.update_saved_count()
+        self.show_message(f"Loaded: {path}")
+
+
+    def on_propagate_clicked(self):
+        # Basic validation
+        if not self._image_paths:
+            QMessageBox.warning(self, "Propagate", "No images in the folder.")
+            return
+        if self._current_image_path is None:
+            QMessageBox.warning(self, "Propagate", "Please select an image first.")
+            return
+        if self.viewer.get_object_count() == 0:
+            QMessageBox.information(self, "Propagate", "No saved objects on the current image.")
+            return
+
+        helper = self.viewer._seg  # Sam2Helper
+        if helper is None or helper.propagator is None:
+            QMessageBox.critical(self, "Propagate", "SAM2 propagator is not initialized.")
+            return
+
+        # Seed prompts
+        prompts, obj_id_to_class_id = self._collect_prompts_from_saved_objects()
+        if not prompts:
+            QMessageBox.information(self, "Propagate", "No prompts with clicks to seed propagation.")
+            return
+
+        # Init first frame
+        if not self._init_propagation(helper, self._current_image_path):
+            return
+
+        # Add prompts
+        try:
+            helper.add_prompts(prompts)
+        except Exception as ex:
+            QMessageBox.critical(self, "Propagate", f"Failed to add prompts:\n{ex}")
+            return
+
+        # Track across folder and write YOLO
+        frames = self._all_frame_paths()
+        wrote = self._iterate_and_write_yolo(helper, frames, obj_id_to_class_id)
+
+        self.show_message(f"Propagation complete. Wrote labels for {wrote} images.")
+        QMessageBox.information(self, "Propagate", f"Propagation complete.\nWrote labels for {wrote} images.")
+
     def show_score(self, s: Optional[float]):
         if s is None:
             self.status.clearMessage()
         else:
             self.status.showMessage(f"Mask score: {s:.3f}")
-    
+
     def on_class_clicked(self, item):
         name = item.text()
         if self.viewer.has_pending():
@@ -641,47 +745,160 @@ class MainWindow(QMainWindow):
         else:
             self.viewer.set_selected_class(name)
             self.show_message(f"Selected class: {name}")
+
     def update_saved_count(self):
         self.saved_label.setText(f"Saved: {self.viewer.get_object_count()}")
 
     def set_selected_class_name(self, name: str, announce: bool = True):
-        # Programmatically highlight the class; does NOT trigger itemClicked.
         for row in range(self.class_list.count()):
             if self.class_list.item(row).text() == name:
                 self.class_list.setCurrentRow(row)
                 break
-        # Let the viewer know too (optional but handy)
         self.viewer.set_selected_class(name)
         if announce:
             self.show_message(f"Editing object (class '{name}')")
-
-
-    def update_saved_count(self):
-        self.saved_label.setText(f"Saved: {self.viewer.get_object_count()}")
-
 
     def show_message(self, msg: str):
         self.status.showMessage(msg)
 
     def open_image(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select image", "", "Images (*.png *.jpg *.jpeg *.bmp)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select image", "", "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)")
         if not path:
             return
-        img = cv2.imread(path, cv2.IMREAD_COLOR)
-        if img is None:
-            QMessageBox.critical(self, "Error", f"Failed to read image:\n{path}")
-            return
+        self._load_image_path(path)
+    
+    # --- helpers: UI/data access ---
+
+    def _get_class_names(self) -> list[str]:
+        return [self.class_list.item(i).text() for i in range(self.class_list.count())]
+
+    def _class_id_of(self, class_names: list[str], name: str) -> int:
         try:
-            self.viewer.set_image(img)
-            self.status.showMessage(f"Loaded: {path}")
+            return class_names.index(name)
+        except ValueError:
+            return 0
+
+    def _all_frame_paths(self) -> list[str]:
+        # already sorted when created; keep a defensive sort here
+        return sorted([p for p in (self._image_paths or []) if os.path.isfile(p)])
+    
+    # --- helpers: propagation pipeline ---
+
+    def _collect_prompts_from_saved_objects(self) -> tuple[list[tuple[int, np.ndarray, np.ndarray]], dict[int, int]]:
+        """
+        Returns:
+        prompts: list of (obj_id, points Nx2 float32, labels N int32)
+        obj_id_to_class_id: {obj_id -> class_id}
+        Uses only objects that have 'clicks' (user prompts).
+        """
+        saved_objs = self.viewer.get_history()
+        class_names = self._get_class_names()
+
+        prompts = []
+        obj_id_to_class_id = {}
+        next_id = 1
+
+        for rec in saved_objs:
+            if not rec.clicks:
+                continue
+            pts = np.array([(c.x, c.y) for c in rec.clicks], dtype=np.float32)
+            lbs = np.array([c.label for c in rec.clicks], dtype=np.int32)
+            prompts.append((next_id, pts, lbs))
+            obj_id_to_class_id[next_id] = self._class_id_of(class_names, rec.class_name)
+            next_id += 1
+
+        return prompts, obj_id_to_class_id
+
+
+    def _init_propagation(self, helper, first_image_path: str) -> bool:
+        """
+        Loads first frame into propagator. Returns True on success, False on failure (and shows UI message).
+        """
+        img = cv2.imread(first_image_path, cv2.IMREAD_COLOR)
+        if img is None:
+            QMessageBox.critical(self, "Propagate", f"Failed to read: {first_image_path}")
+            return False
+        try:
+            helper.load_first(img)
+            return True
         except Exception as ex:
-            QMessageBox.critical(self, "Error", str(ex))
+            QMessageBox.critical(self, "Propagate", f"Failed to load first frame:\n{ex}")
+            return False
+
+
+    def _track_one_frame(self, helper, frame_bgr: np.ndarray):
+        """
+        Wraps helper.track(frame_bgr) with a small try/except. Returns (out_obj_ids, out_mask_logits) or (None, None).
+        """
+        try:
+            return helper.track(frame_bgr)
+        except Exception as ex:
+            return None, ex
+
+
+    def _yolo_lines_from_logits_list(self, out_obj_ids, out_mask_logits, obj_id_to_class_id: dict[int, int]) -> list[str]:
+        """
+        Converts SAM2 logits to YOLO-seg lines for a single frame.
+        """
+        yolo_lines = []
+        for i, obj_id in enumerate(out_obj_ids):
+            logits = out_mask_logits[i]
+            # Expect CxHxW; take first channel
+            if hasattr(logits, "shape") and getattr(logits, "ndim", 0) == 3:
+                m = (logits[0] > 0).detach().cpu().numpy().astype(np.uint8)
+            else:
+                m = (logits > 0).detach().cpu().numpy().astype(np.uint8)
+            class_id = obj_id_to_class_id.get(int(obj_id), 0)
+            yolo_lines.extend(mask_to_yolo_lines(m, class_id))
+        return yolo_lines
+
+
+    def _iterate_and_write_yolo(self, helper, frames: list[str], obj_id_to_class_id: dict[int, int]) -> int:
+        """
+        Iterates over frame paths, tracks, and writes YOLO labels. Returns count of frames written.
+        """
+        # Optional autocast for CUDA
+        use_cuda = False
+        try:
+            import torch
+            use_cuda = torch.cuda.is_available()
+        except Exception:
+            pass
+
+        if use_cuda:
+            import torch
+            ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        else:
+            from contextlib import nullcontext
+            ctx = nullcontext()
+
+        wrote = 0
+        with ctx:
+            for path in frames:
+                frame = cv2.imread(path, cv2.IMREAD_COLOR)
+                if frame is None:
+                    self.show_message(f"Skip unreadable: {os.path.basename(path)}")
+                    continue
+
+                out_obj_ids, out_mask_logits_or_err = self._track_one_frame(helper, frame)
+                if out_obj_ids is None:
+                    self.show_message(f"Tracking failed on {os.path.basename(path)}: {out_mask_logits_or_err}")
+                    continue
+
+                yolo_lines = self._yolo_lines_from_logits_list(out_obj_ids, out_mask_logits_or_err, obj_id_to_class_id)
+                txt_path = os.path.splitext(path)[0] + ".txt"
+                save_yolo_seg(txt_path, yolo_lines)
+                wrote += 1
+
+        return wrote
+
+
 
 
 # -------------------- CLI / Entrypoint --------------------
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--images", default="images/0.jpg", help="Folder with images to annotate")
+    ap.add_argument("--images", default="images", help="Folder with images to annotate")
     ap.add_argument("--checkpoint", default="models/sam2.1_hiera_large.pt", help="Path to SAM2/SAM checkpoint .pth")
     ap.add_argument("--config", default="configs/sam2.1/sam2.1_hiera_l.yaml", help="SAM2 (e.g., sam2_hiera_l) or SAM (e.g., vit_h)")
     ap.add_argument("--classes", nargs="*", default=["A1","A2","A3","A4","A5","A6","B1","B2","B3","B4","B5",
@@ -691,37 +908,33 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Load image (or ask)
-    img_bgr = None
-    if args.images:
-        img_bgr = cv2.imread(args.images, cv2.IMREAD_COLOR)
-        if img_bgr is None:
-            print(f"ERROR: Failed to read image: {args.images}", file=sys.stderr)
-            sys.exit(2)
+    # Resolve image list from folder
+    image_paths = list_image_paths(args.images)
+    if not image_paths:
+        print(f"ERROR: No images found in folder: {args.images}", file=sys.stderr)
+        sys.exit(2)
 
     # Build segmenter
     try:
-        seg = Segmenter(args.checkpoint, args.config)
+        seg = Sam2Helper(args.checkpoint, args.config)
     except Exception as e:
-        print(f"[Segmenter Init Error] {e}", file=sys.stderr)
+        print(f"[Sam2Helper Init Error] {e}", file=sys.stderr)
         sys.exit(3)
 
     app = QApplication(sys.argv)
 
+    # Load only the FIRST image initially (on demand for others)
+    first_path = image_paths[0]
+    img_bgr = cv2.imread(first_path, cv2.IMREAD_COLOR)
     if img_bgr is None:
-        # Show file dialog at startup
-        path, _ = QFileDialog.getOpenFileName(None, "Select image", "", "Images (*.png *.jpg *.jpeg *.bmp)")
-        if not path:
-            print("No image selected. Exiting.")
-            sys.exit(0)
-        img_bgr = cv2.imread(path, cv2.IMREAD_COLOR)
-        if img_bgr is None:
-            print(f"ERROR: Failed to read image: {path}", file=sys.stderr)
-            sys.exit(2)
+        print(f"ERROR: Failed to read image: {first_path}", file=sys.stderr)
+        sys.exit(2)
 
-    w = MainWindow(seg, img_bgr, classes=args.classes)
+    w = MainWindow(seg, img_bgr, classes=args.classes,
+                   images_dir=args.images, image_paths=image_paths)
     w.show()
     sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
     main()
