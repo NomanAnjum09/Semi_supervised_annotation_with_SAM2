@@ -43,6 +43,8 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QMessageBox, QAction,
     QListWidget, QAbstractItemView, QFrame, QListWidgetItem, QPushButton
 )
+from PyQt5.QtWidgets import QProgressDialog
+
 
 from src.helpers import ObjRecord,Click, list_image_paths, load_yolo_seg, mask_to_yolo_lines, merge_yolo_seg
 from src.sam_helper import Sam2Helper
@@ -723,7 +725,7 @@ class MainWindow(QMainWindow):
 
         # Track across folder and write YOLO
         frames = self._all_frame_paths()
-        wrote = self._iterate_and_write_yolo(helper, frames, obj_id_to_class_id)
+        wrote = self._propagate_blocking(helper, frames, obj_id_to_class_id)
 
         self.show_message(f"Propagation complete. Wrote labels for {wrote} images.")
         QMessageBox.information(self, "Propagate", f"Propagation complete.\nWrote labels for {wrote} images.")
@@ -853,10 +855,24 @@ class MainWindow(QMainWindow):
         return yolo_lines
 
 
-    def _iterate_and_write_yolo(self, helper, frames: list[str], obj_id_to_class_id: dict[int, int]) -> int:
+    def _propagate_blocking(self, helper, frames: list[str], obj_id_to_class_id: dict[int, int]) -> int:
         """
-        Iterates over frame paths, tracks, and writes YOLO labels. Returns count of frames written.
+        Runs propagation synchronously with a modal progress dialog.
+        Blocks the UI until finished. Returns number of frames written.
         """
+        total = len(frames)
+        dlg = QProgressDialog("Starting…", None, 0, total, self)
+        dlg.setWindowTitle("Propagating")
+        dlg.setWindowModality(Qt.ApplicationModal)     # block UI
+        dlg.setCancelButton(None)                      # no cancel button
+        dlg.setAutoClose(True)
+        dlg.setAutoReset(True)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+
+        # Optional: wait cursor
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+
         # Optional autocast for CUDA
         use_cuda = False
         try:
@@ -873,24 +889,51 @@ class MainWindow(QMainWindow):
             ctx = nullcontext()
 
         wrote = 0
-        with ctx:
-            for path in frames:
-                frame = cv2.imread(path, cv2.IMREAD_COLOR)
-                if frame is None:
-                    self.show_message(f"Skip unreadable: {os.path.basename(path)}")
-                    continue
+        try:
+            with ctx:
+                for idx, path in enumerate(frames, 1):
+                    # update progress text
+                    dlg.setLabelText(f"Processing {os.path.basename(path)} ({idx}/{total})…")
+                    dlg.setValue(idx - 1)             # show progress before work
+                    QApplication.processEvents()      # repaint dialog while blocking UI
 
-                out_obj_ids, out_mask_logits_or_err = self._track_one_frame(helper, frame)
-                if out_obj_ids is None:
-                    self.show_message(f"Tracking failed on {os.path.basename(path)}: {out_mask_logits_or_err}")
-                    continue
+                    frame = cv2.imread(path, cv2.IMREAD_COLOR)
+                    if frame is None:
+                        continue
 
-                yolo_lines = self._yolo_lines_from_logits_list(out_obj_ids, out_mask_logits_or_err, obj_id_to_class_id)
-                txt_path = os.path.splitext(path)[0] + ".txt"
-                merge_yolo_seg(txt_path, yolo_lines, dedup=True)
-                wrote += 1
+                    try:
+                        out_obj_ids, out_mask_logits = helper.track(frame)
+                    except Exception as ex:
+                        # Non-fatal: skip this frame
+                        self.show_message(f"Tracking failed on {os.path.basename(path)}: {ex}")
+                        continue
+
+                    # Convert logits -> YOLO lines
+                    yolo_lines = []
+                    for i, obj_id in enumerate(out_obj_ids):
+                        logits = out_mask_logits[i]
+                        if hasattr(logits, "shape") and getattr(logits, "ndim", 0) == 3:
+                            m = (logits[0] > 0).detach().cpu().numpy().astype(np.uint8)
+                        else:
+                            m = (logits > 0).detach().cpu().numpy().astype(np.uint8)
+                        class_id = obj_id_to_class_id.get(int(obj_id), 0)
+                        yolo_lines.extend(mask_to_yolo_lines(m, class_id))
+
+                    # Merge (append without overwriting)
+                    txt_path = os.path.splitext(path)[0] + ".txt"
+                    merge_yolo_seg(txt_path, yolo_lines, dedup=True)
+                    wrote += 1
+
+                    dlg.setValue(idx)                 # advance after work
+                    QApplication.processEvents()
+
+            dlg.setValue(total)
+        finally:
+            dlg.close()
+            QApplication.restoreOverrideCursor()
 
         return wrote
+
 
 
 
