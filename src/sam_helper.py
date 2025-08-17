@@ -27,7 +27,7 @@ class Sam2Helper:
             # Propagator (video/camera tracker)
             self.propagator = build_sam2_camera_predictor(config, ckpt_path, device=self.device)
             # Image predictor (hover/click refine)
-            sam2 = build_sam2(config, ckpt_path)
+            sam2 = build_sam2(config, ckpt_path,device=self.device)
             sam2.to(self.device)
             self.predictor = SAM2ImagePredictor(sam2)
             self.kind = "sam2"
