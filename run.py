@@ -21,11 +21,22 @@ from src.main_ui import MainWindow
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--images", default="images", help="Folder with images to annotate")
-    ap.add_argument("--checkpoint", default="models/sam2.1_hiera_large.pt", help="Path to SAM2/SAM checkpoint .pth")
-    ap.add_argument("--config", default="configs/sam2.1/sam2.1_hiera_l.yaml", help="SAM2 (e.g., sam2_hiera_l) or SAM (e.g., vit_h)")
+    ap.add_argument("--model_type", default="large", help="SAM2 model type: tiny/small/large")
     ap.add_argument("--classes", nargs="*", default=["A1","A2","A3","A4","A5","A6","B1","B2","B3","B4","B5",
                                                      "B6","C1","C2","C3","C4","C5","C6"], help="Initial class names")
     return ap.parse_args()
+
+
+def get_model_config(type):
+    if type == "large":
+        print("Loading Large Model")
+        return "models/sam2.1_hiera_large.pt", "configs/sam2.1/sam2.1_hiera_l.yaml"
+    elif type == "small":
+        print("Loading Small Model")
+        return "models/sam2.1_hiera_small.pt", "configs/sam2.1/sam2.1_hiera_s.yaml"
+    else:
+        print("Loading Tiny Model")
+        return "models/sam2.1_hiera_tiny.pt","configs/sam2.1/sam2.1_hiera_t.yaml"
 
 def main():
     args = parse_args()
@@ -38,7 +49,8 @@ def main():
 
     # Build segmenter
     try:
-        seg = Sam2Helper(args.checkpoint, args.config)
+        checkpoint , config = get_model_config(args.model_type)
+        seg = Sam2Helper(checkpoint, config)
     except Exception as e:
         print(f"[Sam2Helper Init Error] {e}", file=sys.stderr)
         sys.exit(3)
